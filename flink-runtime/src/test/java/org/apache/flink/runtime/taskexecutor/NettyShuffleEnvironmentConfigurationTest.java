@@ -22,6 +22,8 @@ import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.MemorySize;
 import org.apache.flink.configuration.NettyShuffleEnvironmentOptions;
 import org.apache.flink.configuration.TaskManagerOptions;
+import org.apache.flink.configuration.description.Formatter;
+import org.apache.flink.configuration.description.HtmlFormatter;
 import org.apache.flink.runtime.taskmanager.NettyShuffleEnvironmentConfiguration;
 import org.apache.flink.util.TestLogger;
 
@@ -32,6 +34,7 @@ import java.net.InetAddress;
 import static org.hamcrest.CoreMatchers.is;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertThat;
+import static org.junit.Assert.assertTrue;
 
 /** Unit test for {@link NettyShuffleEnvironmentConfiguration}. */
 public class NettyShuffleEnvironmentConfigurationTest extends TestLogger {
@@ -75,5 +78,22 @@ public class NettyShuffleEnvironmentConfigurationTest extends TestLogger {
         assertEquals(networkConfig.partitionRequestMaxBackoff(), 200);
         assertEquals(networkConfig.networkBuffersPerChannel(), 10);
         assertEquals(networkConfig.floatingNetworkBuffersPerGate(), 100);
+    }
+
+    /**
+     * Guarantees that when the key of {@link TaskManagerOptions#NETWORK_BATCH_SHUFFLE_READ_MEMORY}
+     * is modified, the config option description of {@link
+     * NettyShuffleEnvironmentOptions#NETWORK_SORT_SHUFFLE_MIN_PARALLELISM} must be changed
+     * correspondingly.
+     */
+    @Test
+    public void testBatchShuffleOffHeapMemoryConfigOption() {
+        Formatter formatter = new HtmlFormatter();
+        String description =
+                formatter.format(
+                        NettyShuffleEnvironmentOptions.NETWORK_SORT_SHUFFLE_MIN_PARALLELISM
+                                .description());
+        assertTrue(
+                description.contains(TaskManagerOptions.NETWORK_BATCH_SHUFFLE_READ_MEMORY.key()));
     }
 }
