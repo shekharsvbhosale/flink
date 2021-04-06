@@ -21,29 +21,35 @@ package org.apache.flink.runtime.highavailability.zookeeper;
 import org.apache.flink.api.common.JobID;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.HighAvailabilityOptions;
+import org.apache.flink.runtime.blob.BlobStore;
 import org.apache.flink.runtime.blob.BlobStoreService;
 import org.apache.flink.runtime.checkpoint.CheckpointRecoveryFactory;
 import org.apache.flink.runtime.checkpoint.ZooKeeperCheckpointRecoveryFactory;
-import org.apache.flink.runtime.highavailability.AbstractHaServices;
+import org.apache.flink.runtime.highavailability.HighAvailabilityServices;
 import org.apache.flink.runtime.highavailability.RunningJobsRegistry;
 import org.apache.flink.runtime.jobmanager.JobGraphStore;
 import org.apache.flink.runtime.leaderelection.LeaderElectionService;
 import org.apache.flink.runtime.leaderretrieval.LeaderRetrievalService;
 import org.apache.flink.runtime.util.ZooKeeperUtils;
+import org.apache.flink.util.ExceptionUtils;
 
 import org.apache.flink.shaded.curator4.org.apache.curator.framework.CuratorFramework;
 import org.apache.flink.shaded.curator4.org.apache.curator.utils.ZKPaths;
 import org.apache.flink.shaded.zookeeper3.org.apache.zookeeper.KeeperException;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import javax.annotation.Nonnull;
 
+import java.io.IOException;
 import java.util.concurrent.Executor;
 
 import static org.apache.flink.util.Preconditions.checkNotNull;
 
 /**
- * An implementation of the {@link AbstractHaServices} using Apache ZooKeeper. The services store
- * data in ZooKeeper's nodes as illustrated by the following tree structure:
+ * An implementation of the {@link HighAvailabilityServices} using Apache ZooKeeper. The services
+ * store data in ZooKeeper's nodes as illustrated by the following tree structure:
  *
  * <pre>
  * /flink
@@ -79,7 +85,9 @@ import static org.apache.flink.util.Preconditions.checkNotNull;
  * HighAvailabilityOptions#HA_CLUSTER_ID}. All nodes with the same cluster id will join the same
  * cluster and participate in the execution of the same set of jobs.
  */
-public class ZooKeeperHaServices extends AbstractHaServices {
+public class ZooKeeperHaServices implements HighAvailabilityServices {
+
+    private static final Logger LOG = LoggerFactory.getLogger(ZooKeeperHaServices.class);
 
     private static final String RESOURCE_MANAGER_LEADER_PATH = "/resource_manager_lock";
 
@@ -94,72 +102,164 @@ public class ZooKeeperHaServices extends AbstractHaServices {
     /** The ZooKeeper client to use. */
     private final CuratorFramework client;
 
+    /** The executor to run ZooKeeper callbacks on. */
+    private final Executor executor;
+
+    /** The runtime configuration. */
+    private final Configuration configuration;
+
+    /** The zookeeper based running jobs registry. */
+    private final RunningJobsRegistry runningJobsRegistry;
+
+    /** Store for arbitrary blobs. */
+    private final BlobStoreService blobStoreService;
+
     public ZooKeeperHaServices(
             CuratorFramework client,
             Executor executor,
             Configuration configuration,
             BlobStoreService blobStoreService) {
-        super(configuration, executor, blobStoreService);
         this.client = checkNotNull(client);
+        this.executor = checkNotNull(executor);
+        this.configuration = checkNotNull(configuration);
+        this.runningJobsRegistry = new ZooKeeperRunningJobsRegistry(client, configuration);
+
+        this.blobStoreService = checkNotNull(blobStoreService);
+    }
+
+    // ------------------------------------------------------------------------
+    //  Services
+    // ------------------------------------------------------------------------
+
+    @Override
+    public LeaderRetrievalService getResourceManagerLeaderRetriever() {
+        return ZooKeeperUtils.createLeaderRetrievalService(
+                client, configuration, RESOURCE_MANAGER_LEADER_PATH);
     }
 
     @Override
-    public CheckpointRecoveryFactory createCheckpointRecoveryFactory() {
-        return new ZooKeeperCheckpointRecoveryFactory(client, configuration, ioExecutor);
+    public LeaderRetrievalService getDispatcherLeaderRetriever() {
+        return ZooKeeperUtils.createLeaderRetrievalService(
+                client, configuration, DISPATCHER_LEADER_PATH);
     }
 
     @Override
-    public JobGraphStore createJobGraphStore() throws Exception {
+    public LeaderRetrievalService getJobManagerLeaderRetriever(JobID jobID) {
+        return ZooKeeperUtils.createLeaderRetrievalService(
+                client, configuration, getPathForJobManager(jobID));
+    }
+
+    @Override
+    public LeaderRetrievalService getJobManagerLeaderRetriever(
+            JobID jobID, String defaultJobManagerAddress) {
+        return getJobManagerLeaderRetriever(jobID);
+    }
+
+    @Override
+    public LeaderRetrievalService getClusterRestEndpointLeaderRetriever() {
+        return ZooKeeperUtils.createLeaderRetrievalService(
+                client, configuration, REST_SERVER_LEADER_PATH);
+    }
+
+    @Override
+    public LeaderElectionService getResourceManagerLeaderElectionService() {
+        return ZooKeeperUtils.createLeaderElectionService(
+                client, configuration, RESOURCE_MANAGER_LEADER_PATH);
+    }
+
+    @Override
+    public LeaderElectionService getDispatcherLeaderElectionService() {
+        return ZooKeeperUtils.createLeaderElectionService(
+                client, configuration, DISPATCHER_LEADER_PATH);
+    }
+
+    @Override
+    public LeaderElectionService getJobManagerLeaderElectionService(JobID jobID) {
+        return ZooKeeperUtils.createLeaderElectionService(
+                client, configuration, getPathForJobManager(jobID));
+    }
+
+    @Override
+    public LeaderElectionService getClusterRestEndpointLeaderElectionService() {
+        return ZooKeeperUtils.createLeaderElectionService(
+                client, configuration, REST_SERVER_LEADER_PATH);
+    }
+
+    @Override
+    public CheckpointRecoveryFactory getCheckpointRecoveryFactory() {
+        return new ZooKeeperCheckpointRecoveryFactory(client, configuration, executor);
+    }
+
+    @Override
+    public JobGraphStore getJobGraphStore() throws Exception {
         return ZooKeeperUtils.createJobGraphs(client, configuration);
     }
 
     @Override
-    public RunningJobsRegistry createRunningJobsRegistry() {
-        return new ZooKeeperRunningJobsRegistry(client, configuration);
+    public RunningJobsRegistry getRunningJobsRegistry() {
+        return runningJobsRegistry;
     }
 
     @Override
-    protected LeaderElectionService createLeaderElectionService(String leaderName) {
-        return ZooKeeperUtils.createLeaderElectionService(client, configuration, leaderName);
-    }
-
-    @Override
-    protected LeaderRetrievalService createLeaderRetrievalService(String leaderName) {
-        return ZooKeeperUtils.createLeaderRetrievalService(client, configuration, leaderName);
-    }
-
-    @Override
-    public void internalClose() {
-        client.close();
-    }
-
-    @Override
-    public void internalCleanup() throws Exception {
-        cleanupZooKeeperPaths();
-    }
-
-    @Override
-    protected String getLeaderNameForResourceManager() {
-        return RESOURCE_MANAGER_LEADER_PATH;
-    }
-
-    @Override
-    protected String getLeaderNameForDispatcher() {
-        return DISPATCHER_LEADER_PATH;
-    }
-
-    public String getLeaderNameForJobManager(final JobID jobID) {
-        return "/" + jobID + JOB_MANAGER_LEADER_PATH;
-    }
-
-    @Override
-    protected String getLeaderNameForRestServer() {
-        return REST_SERVER_LEADER_PATH;
+    public BlobStore createBlobStore() throws IOException {
+        return blobStoreService;
     }
 
     // ------------------------------------------------------------------------
-    //  Utilities
+    //  Shutdown
     // ------------------------------------------------------------------------
+
+    @Override
+    public void close() throws Exception {
+        Throwable exception = null;
+
+        try {
+            blobStoreService.close();
+        } catch (Throwable t) {
+            exception = t;
+        }
+
+        internalClose();
+
+        if (exception != null) {
+            ExceptionUtils.rethrowException(
+                    exception, "Could not properly close the ZooKeeperHaServices.");
+        }
+    }
+
+    @Override
+    public void closeAndCleanupAllData() throws Exception {
+        LOG.info("Close and clean up all data for ZooKeeperHaServices.");
+
+        Throwable exception = null;
+
+        boolean deletedHAData = false;
+
+        try {
+            cleanupZooKeeperPaths();
+            deletedHAData = true;
+        } catch (Exception e) {
+            exception = e;
+        }
+
+        internalClose();
+
+        try {
+            if (deletedHAData) {
+                blobStoreService.closeAndCleanupAllData();
+            } else {
+                blobStoreService.close();
+            }
+        } catch (Throwable t) {
+            exception = ExceptionUtils.firstOrSuppressed(t, exception);
+        }
+
+        if (exception != null) {
+            ExceptionUtils.rethrowException(
+                    exception,
+                    "Could not properly close and clean up all data of ZooKeeperHaServices.");
+        }
+    }
 
     /** Cleans up leftover ZooKeeper paths. */
     private void cleanupZooKeeperPaths() throws Exception {
@@ -181,7 +281,7 @@ public class ZooKeeperHaServices extends AbstractHaServices {
                 zNodeDeleted = true;
             } catch (KeeperException.NoNodeException ignored) {
                 // concurrent delete operation. Try again.
-                logger.debug(
+                LOG.debug(
                         "Retrying to delete owned znode because of other concurrent delete operation.");
             }
         }
@@ -225,5 +325,18 @@ public class ZooKeeperHaServices extends AbstractHaServices {
     @Nonnull
     private static String getParentPath(String path) {
         return ZKPaths.getPathAndNode(path).getPath();
+    }
+
+    /** Closes components which don't distinguish between close and closeAndCleanupAllData. */
+    private void internalClose() {
+        client.close();
+    }
+
+    // ------------------------------------------------------------------------
+    //  Utilities
+    // ------------------------------------------------------------------------
+
+    private static String getPathForJobManager(final JobID jobID) {
+        return "/" + jobID + JOB_MANAGER_LEADER_PATH;
     }
 }
