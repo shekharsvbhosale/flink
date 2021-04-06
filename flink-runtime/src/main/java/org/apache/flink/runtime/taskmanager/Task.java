@@ -990,12 +990,20 @@ public class Task
             }
         }
 
-        for (InputGate inputGate : inputGates) {
-            try {
-                inputGate.close();
-            } catch (Throwable t) {
-                ExceptionUtils.rethrowIfFatalError(t);
-                LOG.error("Failed to release input gate for task {}.", taskNameWithSubtask, t);
+        AbstractInvokable invokable = this.invokable;
+        if (invokable == null || !invokable.isUsingNonBlockingInput()) {
+            // Cleanup resources instead of invokable if it is null,
+            // or prevent it from being blocked on input,
+            // or interrupt if it is already blocked.
+            // Not needed for StreamTask (which does NOT use blocking input); for which this could
+            // cause race conditions
+            for (InputGate inputGate : inputGates) {
+                try {
+                    inputGate.close();
+                } catch (Throwable t) {
+                    ExceptionUtils.rethrowIfFatalError(t);
+                    LOG.error("Failed to release input gate for task {}.", taskNameWithSubtask, t);
+                }
             }
         }
     }
@@ -1395,9 +1403,7 @@ public class Task
             throws FlinkException {
         final AbstractInvokable invokable = this.invokable;
 
-        if (invokable == null
-                || (executionState != ExecutionState.RUNNING
-                        && executionState != ExecutionState.RECOVERING)) {
+        if (invokable == null || executionState != ExecutionState.RUNNING) {
             throw new TaskNotRunningException("Task is not yet running.");
         }
 
@@ -1406,8 +1412,7 @@ public class Task
         } catch (Throwable t) {
             ExceptionUtils.rethrowIfFatalErrorOrOOM(t);
 
-            if (getExecutionState() == ExecutionState.RUNNING
-                    || getExecutionState() == ExecutionState.RECOVERING) {
+            if (getExecutionState() == ExecutionState.RUNNING) {
                 FlinkException e = new FlinkException("Error while handling operator event", t);
                 failExternally(e);
                 throw e;

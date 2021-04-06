@@ -44,7 +44,6 @@ import org.apache.flink.runtime.io.network.api.writer.RecordWriterDelegate;
 import org.apache.flink.runtime.io.network.api.writer.ResultPartitionWriter;
 import org.apache.flink.runtime.io.network.api.writer.SingleRecordWriter;
 import org.apache.flink.runtime.io.network.partition.ChannelStateHolder;
-import org.apache.flink.runtime.io.network.partition.consumer.IndexedInputGate;
 import org.apache.flink.runtime.io.network.partition.consumer.InputGate;
 import org.apache.flink.runtime.jobgraph.OperatorID;
 import org.apache.flink.runtime.jobgraph.tasks.AbstractInvokable;
@@ -110,7 +109,6 @@ import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadFactory;
 
 import static org.apache.flink.runtime.concurrent.FutureUtils.assertNoException;
-import static org.apache.flink.util.Preconditions.checkState;
 
 /**
  * Base class for all streaming tasks. A task is the unit of local processing that is deployed and
@@ -450,7 +448,7 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>> extends Ab
     }
 
     private void setSynchronousSavepointId(long checkpointId, boolean ignoreEndOfInput) {
-        checkState(
+        Preconditions.checkState(
                 syncSavepointId == null,
                 "at most one stop-with-savepoint checkpoint at a time is allowed");
         syncSavepointId = checkpointId;
@@ -528,12 +526,7 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>> extends Ab
         }
     }
 
-    @Override
-    public void restore() throws Exception {
-        if (isRunning) {
-            LOG.debug("Re-restore attempt rejected.");
-            return;
-        }
+    protected void beforeInvoke() throws Exception {
         disposedOperators = false;
         LOG.debug("Initializing {}.", getName());
 
@@ -544,87 +537,70 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>> extends Ab
         init();
 
         // save the work of reloading state, etc, if the task is already canceled
-        ensureNotCanceled();
+        if (canceled) {
+            throw new CancelTaskException();
+        }
 
         // -------- Invoke --------
         LOG.debug("Invoking {}", getName());
 
         // we need to make sure that any triggers scheduled in open() cannot be
         // executed before all operators are opened
-        CompletableFuture<Void> allGatesRecoveredFuture = actionExecutor.call(this::restoreGates);
-
-        // Run mailbox until all gates will be recovered.
-        mailboxProcessor.runMailboxLoop();
-
-        ensureNotCanceled();
-
-        checkState(
-                allGatesRecoveredFuture.isDone(),
-                "Mailbox loop interrupted before recovery was finished.");
-
-        isRunning = true;
-    }
-
-    private CompletableFuture<Void> restoreGates() throws Exception {
-        SequentialChannelStateReader reader =
-                getEnvironment().getTaskStateManager().getSequentialChannelStateReader();
-        reader.readOutputData(
-                getEnvironment().getAllWriters(), !configuration.isGraphContainingLoops());
-
-        operatorChain.initializeStateAndOpenOperators(createStreamTaskStateInitializer());
-
-        IndexedInputGate[] inputGates = getEnvironment().getAllInputGates();
-        channelIOExecutor.execute(
+        actionExecutor.runThrowing(
                 () -> {
-                    try {
-                        reader.readInputData(inputGates);
-                    } catch (Exception e) {
-                        asyncExceptionHandler.handleAsyncException(
-                                "Unable to read channel state", e);
+                    SequentialChannelStateReader reader =
+                            getEnvironment()
+                                    .getTaskStateManager()
+                                    .getSequentialChannelStateReader();
+                    reader.readOutputData(
+                            getEnvironment().getAllWriters(),
+                            !configuration.isGraphContainingLoops());
+
+                    operatorChain.initializeStateAndOpenOperators(
+                            createStreamTaskStateInitializer());
+
+                    channelIOExecutor.execute(
+                            () -> {
+                                try {
+                                    reader.readInputData(getEnvironment().getAllInputGates());
+                                } catch (Exception e) {
+                                    asyncExceptionHandler.handleAsyncException(
+                                            "Unable to read channel state", e);
+                                }
+                            });
+
+                    for (InputGate inputGate : getEnvironment().getAllInputGates()) {
+                        inputGate
+                                .getStateConsumedFuture()
+                                .thenRun(
+                                        () ->
+                                                mainMailboxExecutor.execute(
+                                                        inputGate::requestPartitions,
+                                                        "Input gate request partitions"));
                     }
                 });
 
-        List<CompletableFuture<?>> recoveredFutures = new ArrayList<>(inputGates.length);
-        for (InputGate inputGate : inputGates) {
-            recoveredFutures.add(inputGate.getStateConsumedFuture());
-
-            inputGate
-                    .getStateConsumedFuture()
-                    .thenRun(
-                            () ->
-                                    mainMailboxExecutor.execute(
-                                            inputGate::requestPartitions,
-                                            "Input gate request partitions"));
-        }
-
-        return CompletableFuture.allOf(recoveredFutures.toArray(new CompletableFuture[0]))
-                .thenRun(mailboxProcessor::suspend);
-    }
-
-    private void ensureNotCanceled() {
-        if (canceled) {
-            throw new CancelTaskException();
-        }
+        isRunning = true;
     }
 
     @Override
     public final void invoke() throws Exception {
         try {
-            // Allow invoking method 'invoke' without having to call 'restore' before it.
-            if (!isRunning) {
-                LOG.debug("Restoring during invoke will be called.");
-                restore();
-            }
+            beforeInvoke();
 
             // final check to exit early before starting to run
-            ensureNotCanceled();
+            if (canceled) {
+                throw new CancelTaskException();
+            }
 
             // let the task do its work
             runMailboxLoop();
 
             // if this left the run() method cleanly despite the fact that this was canceled,
             // make sure the "clean shutdown" is not attempted
-            ensureNotCanceled();
+            if (canceled) {
+                throw new CancelTaskException();
+            }
 
             afterInvoke();
         } catch (Throwable invokeException) {
@@ -1413,5 +1389,10 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>> extends Ab
             timer.markEnd();
             suspendedDefaultAction.resume();
         }
+    }
+
+    @Override
+    public boolean isUsingNonBlockingInput() {
+        return true;
     }
 }
