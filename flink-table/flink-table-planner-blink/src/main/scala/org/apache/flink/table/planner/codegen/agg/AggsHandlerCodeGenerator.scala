@@ -1104,9 +1104,9 @@ class AggsHandlerCodeGenerator(
      if ("UTC".equals(shiftTimeZone.getId)) {
        itemExpr
      } else {
-       val timeZoneId = ctx.addReusableShiftTimeZone(shiftTimeZone)
        s"""
-          |$TIME_WINDOW_UTIL.toEpochMills($itemExpr, $timeZoneId)
+          |$TIME_WINDOW_UTIL.toEpochMills(
+          |$itemExpr, java.time.ZoneId.of("${shiftTimeZone.getId}"))
           """.stripMargin
      }
   }
