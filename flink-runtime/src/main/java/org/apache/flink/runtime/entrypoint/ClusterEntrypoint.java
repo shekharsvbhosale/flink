@@ -165,7 +165,7 @@ public abstract class ClusterEntrypoint implements AutoCloseableAsync, FatalErro
 
         shutDownHook =
                 ShutdownHookUtil.addShutdownHook(
-                        this::cleanupDirectories, getClass().getSimpleName(), LOG);
+                        () -> this.closeAsync().join(), getClass().getSimpleName(), LOG);
     }
 
     public CompletableFuture<ApplicationStatus> getTerminationFuture() {
@@ -198,6 +198,7 @@ public abstract class ClusterEntrypoint implements AutoCloseableAsync, FatalErro
                 // clean up any partial state
                 shutDownAsync(
                                 ApplicationStatus.FAILED,
+                                ShutdownReason.FLINK_INTERNAL,
                                 ExceptionUtils.stringifyException(strippedThrowable),
                                 false)
                         .get(
@@ -266,13 +267,18 @@ public abstract class ClusterEntrypoint implements AutoCloseableAsync, FatalErro
                                 if (throwable != null) {
                                     shutDownAsync(
                                             ApplicationStatus.UNKNOWN,
+                                            ShutdownReason.FLINK_INTERNAL,
                                             ExceptionUtils.stringifyException(throwable),
                                             false);
                                 } else {
                                     // This is the general shutdown path. If a separate more
                                     // specific shutdown was
                                     // already triggered, this will do nothing
-                                    shutDownAsync(applicationStatus, null, true);
+                                    shutDownAsync(
+                                            applicationStatus,
+                                            ShutdownReason.FLINK_INTERNAL,
+                                            null,
+                                            true);
                                 }
                             });
         }
@@ -363,10 +369,13 @@ public abstract class ClusterEntrypoint implements AutoCloseableAsync, FatalErro
 
     @Override
     public CompletableFuture<Void> closeAsync() {
+        ShutdownHookUtil.removeShutdownHook(shutDownHook, getClass().getSimpleName(), LOG);
+
         return shutDownAsync(
                         ApplicationStatus.UNKNOWN,
+                        ShutdownReason.EXTERNAL,
                         "Cluster entrypoint has been closed externally.",
-                        true)
+                        false)
                 .thenAccept(ignored -> {});
     }
 
@@ -465,6 +474,7 @@ public abstract class ClusterEntrypoint implements AutoCloseableAsync, FatalErro
 
     private CompletableFuture<ApplicationStatus> shutDownAsync(
             ApplicationStatus applicationStatus,
+            ShutdownReason shutdownReason,
             @Nullable String diagnostics,
             boolean cleanupHaData) {
         if (isShutDown.compareAndSet(false, true)) {
@@ -475,7 +485,7 @@ public abstract class ClusterEntrypoint implements AutoCloseableAsync, FatalErro
                     diagnostics);
 
             final CompletableFuture<Void> shutDownApplicationFuture =
-                    closeClusterComponent(applicationStatus, diagnostics);
+                    closeClusterComponent(applicationStatus, shutdownReason, diagnostics);
 
             final CompletableFuture<Void> serviceShutdownFuture =
                     FutureUtils.composeAfterwards(
@@ -498,19 +508,28 @@ public abstract class ClusterEntrypoint implements AutoCloseableAsync, FatalErro
     }
 
     /**
-     * Deregister the Flink application from the resource management system by signalling the {@link
-     * ResourceManager}.
+     * Close cluster components and deregister the Flink application from the resource management
+     * system by signalling the {@link ResourceManager}.
      *
      * @param applicationStatus to terminate the application with
+     * @param shutdownReason shutdown reason
      * @param diagnostics additional information about the shut down, can be {@code null}
      * @return Future which is completed once the shut down
      */
     private CompletableFuture<Void> closeClusterComponent(
-            ApplicationStatus applicationStatus, @Nullable String diagnostics) {
+            ApplicationStatus applicationStatus,
+            ShutdownReason shutdownReason,
+            @Nullable String diagnostics) {
         synchronized (lock) {
             if (clusterComponent != null) {
-                return clusterComponent.deregisterApplicationAndClose(
-                        applicationStatus, diagnostics);
+                switch (shutdownReason) {
+                    case FLINK_INTERNAL:
+                        return clusterComponent.deregisterApplicationAndClose(
+                                applicationStatus, diagnostics);
+                    case EXTERNAL:
+                    default:
+                        return clusterComponent.closeAsyncWithoutDeregisteringApplication();
+                }
             } else {
                 return CompletableFuture.completedFuture(null);
             }
@@ -523,8 +542,6 @@ public abstract class ClusterEntrypoint implements AutoCloseableAsync, FatalErro
      * @throws IOException if the temporary directories could not be cleaned up
      */
     protected void cleanupDirectories() throws IOException {
-        ShutdownHookUtil.removeShutdownHook(shutDownHook, getClass().getSimpleName(), LOG);
-
         final String webTmpDir = configuration.getString(WebOptions.TMP_DIR);
 
         FileUtils.deleteDirectory(new File(webTmpDir));
@@ -614,5 +631,16 @@ public abstract class ClusterEntrypoint implements AutoCloseableAsync, FatalErro
 
         /** Directly stops after the job has finished. */
         DETACHED
+    }
+
+    /** The shutdown reason for {@link #shutDownAsync}. */
+    private enum ShutdownReason {
+        /**
+         * Flink needs to shutdown the cluster internally. We will deregister the application from
+         * resource management.
+         */
+        FLINK_INTERNAL,
+        /** The cluster entrypoint is killed externally. We will not deregister the application. */
+        EXTERNAL
     }
 }
