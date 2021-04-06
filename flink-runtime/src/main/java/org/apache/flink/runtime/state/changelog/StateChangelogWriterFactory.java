@@ -19,19 +19,29 @@
 package org.apache.flink.runtime.state.changelog;
 
 import org.apache.flink.annotation.Internal;
+import org.apache.flink.configuration.ReadableConfig;
 import org.apache.flink.runtime.jobgraph.OperatorID;
 import org.apache.flink.runtime.state.KeyGroupRange;
+
+import java.io.IOException;
+import java.io.Serializable;
 
 /**
  * {@link StateChangelogWriter} factory. Scoped to a single entity (e.g. a SubTask or
  * OperatorCoordinator). Please use {@link StateChangelogWriterFactoryLoader} to obtain an instance.
  */
 @Internal
-public interface StateChangelogWriterFactory<Handle extends StateChangelogHandle<?>>
-        extends AutoCloseable {
+public interface StateChangelogWriterFactory<
+                ReaderContext, Handle extends StateChangelogHandle<ReaderContext>>
+        extends AutoCloseable, Serializable {
 
-    StateChangelogWriter<Handle> createWriter(OperatorID operatorID, KeyGroupRange keyGroupRange);
+    StateChangelogWriter<Handle> createWriter(String operatorID, KeyGroupRange keyGroupRange);
 
     @Override
     default void close() throws Exception {}
+
+    ReaderContext getReaderContext();
+
+    /** Configure this factory. Should be called at most once. */
+    void configure(ReadableConfig config) throws IOException;
 }

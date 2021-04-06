@@ -43,23 +43,41 @@ import org.apache.flink.runtime.state.KeyedStateBackend;
 import org.apache.flink.runtime.state.KeyedStateFunction;
 import org.apache.flink.runtime.state.KeyedStateHandle;
 import org.apache.flink.runtime.state.PriorityComparable;
+import org.apache.flink.runtime.state.RegisteredKeyValueStateBackendMetaInfo;
+import org.apache.flink.runtime.state.RegisteredPriorityQueueStateBackendMetaInfo;
 import org.apache.flink.runtime.state.SavepointResources;
 import org.apache.flink.runtime.state.SnapshotResult;
 import org.apache.flink.runtime.state.StateSnapshotTransformer;
 import org.apache.flink.runtime.state.TestableKeyedStateBackend;
+import org.apache.flink.runtime.state.changelog.ChangelogStateBackendHandle;
+import org.apache.flink.runtime.state.changelog.ChangelogStateBackendHandle.ChangelogStateBackendHandleImpl;
+import org.apache.flink.runtime.state.changelog.SequenceNumber;
+import org.apache.flink.runtime.state.changelog.StateChangelogHandle;
+import org.apache.flink.runtime.state.changelog.StateChangelogWriter;
 import org.apache.flink.runtime.state.heap.HeapPriorityQueueElement;
+import org.apache.flink.runtime.state.heap.InternalKeyContext;
 import org.apache.flink.runtime.state.internal.InternalKvState;
-import org.apache.flink.runtime.state.metrics.LatencyTrackingStateFactory;
 import org.apache.flink.runtime.state.ttl.TtlStateFactory;
 import org.apache.flink.runtime.state.ttl.TtlTimeProvider;
 import org.apache.flink.util.FlinkRuntimeException;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
 
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.RunnableFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -72,10 +90,11 @@ import static org.apache.flink.util.Preconditions.checkNotNull;
  * @param <K> The key by which state is keyed.
  */
 @Internal
-class ChangelogKeyedStateBackend<K>
+class ChangelogKeyedStateBackend<K, R>
         implements CheckpointableKeyedStateBackend<K>,
                 CheckpointListener,
                 TestableKeyedStateBackend {
+    private static final Logger LOG = LoggerFactory.getLogger(ChangelogKeyedStateBackend.class);
 
     private static final Map<Class<? extends StateDescriptor>, StateFactory> STATE_FACTORIES =
             Stream.of(
@@ -109,6 +128,10 @@ class ChangelogKeyedStateBackend<K>
 
     private final TtlTimeProvider ttlTimeProvider;
 
+    private final StateChangelogWriter<StateChangelogHandle<R>> stateChangelogWriter;
+
+    private long lastCheckpointId = -1L;
+
     /** last accessed partitioned state. */
     @SuppressWarnings("rawtypes")
     private InternalKvState lastState;
@@ -116,14 +139,27 @@ class ChangelogKeyedStateBackend<K>
     /** For caching the last accessed partitioned state. */
     private String lastName;
 
+    private final List<KeyedStateHandle> prevDelta = new ArrayList<>();
+    private final List<KeyedStateHandle> base = new ArrayList<>();
+    @Nullable private SequenceNumber lastUploadedFrom;
+    @Nullable private SequenceNumber lastUploadedTo;
+    @Nullable private SequenceNumber lastConfirmedTo;
+    private final FunctionDelegationHelper functionDelegationHelper =
+            new FunctionDelegationHelper();
+
     public ChangelogKeyedStateBackend(
             AbstractKeyedStateBackend<K> keyedStateBackend,
             ExecutionConfig executionConfig,
-            TtlTimeProvider ttlTimeProvider) {
+            TtlTimeProvider ttlTimeProvider,
+            StateChangelogWriter<StateChangelogHandle<R>> stateChangelogWriter,
+            Collection<ChangelogStateBackendHandle<R>> initialState) {
         this.keyedStateBackend = keyedStateBackend;
         this.executionConfig = executionConfig;
         this.ttlTimeProvider = ttlTimeProvider;
         this.keyValueStatesByName = new HashMap<>();
+        this.stateChangelogWriter = stateChangelogWriter;
+        this.lastConfirmedTo = SequenceNumber.FIRST;
+        this.completeRestore(initialState);
     }
 
     // -------------------- CheckpointableKeyedStateBackend --------------------------------
@@ -232,14 +268,41 @@ class ChangelogKeyedStateBackend<K>
 
     @Nonnull
     @Override
+    @SuppressWarnings("unchecked")
     public RunnableFuture<SnapshotResult<KeyedStateHandle>> snapshot(
             long checkpointId,
             long timestamp,
             @Nonnull CheckpointStreamFactory streamFactory,
             @Nonnull CheckpointOptions checkpointOptions)
             throws Exception {
-        return keyedStateBackend.snapshot(
-                checkpointId, timestamp, streamFactory, checkpointOptions);
+        lastCheckpointId = checkpointId;
+        lastUploadedFrom = lastConfirmedTo;
+        lastUploadedTo = stateChangelogWriter.lastAppendedSequenceNumber().next();
+        LOG.debug(
+                "snapshot for checkpoint {}, change range: {}..{}",
+                checkpointId,
+                lastUploadedFrom,
+                lastUploadedTo);
+
+        return getRunnableFuture(
+                stateChangelogWriter
+                        .persist(lastUploadedFrom)
+                        .thenApply(this::buildSnapshotResult));
+    }
+
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private SnapshotResult buildSnapshotResult(StateChangelogHandle delta) {
+        // collections don't change once started and handles are immutable
+        List<KeyedStateHandle> prevDeltaCopy = new ArrayList<>(prevDelta);
+        if (delta != null && delta.getStateSize() > 0) {
+            prevDeltaCopy.add(delta);
+        }
+        if (prevDeltaCopy.isEmpty() && base.isEmpty()) {
+            return SnapshotResult.empty();
+        } else {
+            return SnapshotResult.of(
+                    new ChangelogStateBackendHandleImpl(base, prevDeltaCopy, getKeyGroupRange()));
+        }
     }
 
     @Nonnull
@@ -248,8 +311,17 @@ class ChangelogKeyedStateBackend<K>
             KeyGroupedInternalPriorityQueue<T> create(
                     @Nonnull String stateName,
                     @Nonnull TypeSerializer<T> byteOrderedElementSerializer) {
-        return new ChangelogKeyGroupedPriorityQueue<T>(
-                keyedStateBackend.create(stateName, byteOrderedElementSerializer));
+        PqStateChangeLoggerImpl<K, T> logger =
+                new PqStateChangeLoggerImpl<>(
+                        byteOrderedElementSerializer,
+                        keyedStateBackend.getKeyContext(),
+                        stateChangelogWriter,
+                        new RegisteredPriorityQueueStateBackendMetaInfo<>(
+                                stateName, byteOrderedElementSerializer));
+        return new ChangelogKeyGroupedPriorityQueue<>(
+                keyedStateBackend.create(stateName, byteOrderedElementSerializer),
+                logger,
+                byteOrderedElementSerializer);
     }
 
     @VisibleForTesting
@@ -272,11 +344,18 @@ class ChangelogKeyedStateBackend<K>
     // -------------------- CheckpointListener --------------------------------
     @Override
     public void notifyCheckpointComplete(long checkpointId) throws Exception {
+        if (lastCheckpointId == checkpointId) {
+            lastConfirmedTo = lastUploadedTo;
+            stateChangelogWriter.confirm(lastUploadedFrom, lastConfirmedTo);
+        }
         keyedStateBackend.notifyCheckpointComplete(checkpointId);
     }
 
     @Override
     public void notifyCheckpointAborted(long checkpointId) throws Exception {
+        if (lastCheckpointId == checkpointId) {
+            stateChangelogWriter.reset(lastUploadedFrom, lastConfirmedTo);
+        }
         keyedStateBackend.notifyCheckpointAborted(checkpointId);
     }
 
@@ -298,14 +377,12 @@ class ChangelogKeyedStateBackend<K>
                 stateDescriptor.initializeSerializerUnlessSet(executionConfig);
             }
             kvState =
-                    LatencyTrackingStateFactory.createStateAndWrapWithLatencyTrackingIfEnabled(
-                            TtlStateFactory.createStateAndWrapWithTtlIfEnabled(
-                                    namespaceSerializer, stateDescriptor, this, ttlTimeProvider),
-                            stateDescriptor,
-                            keyedStateBackend.getLatencyTrackingStateConfig());
+                    TtlStateFactory.createStateAndWrapWithTtlIfEnabled(
+                            namespaceSerializer, stateDescriptor, this, ttlTimeProvider);
             keyValueStatesByName.put(stateDescriptor.getName(), kvState);
             keyedStateBackend.publishQueryableStateIfEnabled(stateDescriptor, kvState);
         }
+        functionDelegationHelper.addOrUpdate(stateDescriptor);
         return (S) kvState;
     }
 
@@ -327,15 +404,86 @@ class ChangelogKeyedStateBackend<K>
                             stateDesc.getClass(), this.getClass());
             throw new FlinkRuntimeException(message);
         }
+        RegisteredKeyValueStateBackendMetaInfo<N, S> meta =
+                new RegisteredKeyValueStateBackendMetaInfo(
+                        stateDesc.getType(),
+                        stateDesc.getName(),
+                        namespaceSerializer,
+                        stateDesc.getSerializer(),
+                        snapshotTransformFactory);
 
-        return stateFactory.create(
-                keyedStateBackend.createInternalState(
-                        namespaceSerializer, stateDesc, snapshotTransformFactory));
+        InternalKvState<K, N, SV> state =
+            keyedStateBackend.createInternalState(
+                namespaceSerializer, stateDesc, snapshotTransformFactory);
+        KvStateChangeLoggerImpl<K, SV, N> logger =
+            new KvStateChangeLoggerImpl<>(
+                state.getKeySerializer(),
+                state.getNamespaceSerializer(),
+                state.getValueSerializer(),
+                keyedStateBackend.getKeyContext(),
+                stateChangelogWriter,
+                meta);
+        return stateFactory.create(state, logger);
+    }
+
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    private <T> void completeRestore(Collection<ChangelogStateBackendHandle<T>> stateHandles) {
+        if (!stateHandles.isEmpty()) {
+            synchronized (base) { // ensure visibility
+                for (ChangelogStateBackendHandle h : stateHandles) {
+                    if (h != null) {
+                        base.addAll(h.getBasePart());
+                        prevDelta.addAll(h.getDeltaPart());
+                    }
+                }
+            }
+        }
     }
 
     // Factory function interface
     private interface StateFactory {
-        <K, N, SV, S extends State, IS extends S> IS create(InternalKvState<K, N, SV> kvState)
+        <K, N, SV, S extends State, IS extends S> IS create(
+                InternalKvState<K, N, SV> kvState, KvStateChangeLogger<SV, N> changeLogger)
                 throws Exception;
+    }
+
+    @SuppressWarnings("rawtypes")
+    public AbstractChangelogState getStateById(String id) {
+        return (AbstractChangelogState) keyValueStatesByName.get(id); // todo: pq states
+    }
+
+    private static <T> RunnableFuture<T> getRunnableFuture(CompletableFuture<T> f) {
+        return new RunnableFuture<T>() {
+            @Override
+            public void run() {
+                f.join();
+            }
+
+            @Override
+            public boolean cancel(boolean mayInterruptIfRunning) {
+                return f.cancel(mayInterruptIfRunning);
+            }
+
+            @Override
+            public boolean isCancelled() {
+                return f.isCancelled();
+            }
+
+            @Override
+            public boolean isDone() {
+                return f.isDone();
+            }
+
+            @Override
+            public T get() throws InterruptedException, ExecutionException {
+                return f.get();
+            }
+
+            @Override
+            public T get(long timeout, TimeUnit unit)
+                    throws InterruptedException, ExecutionException, TimeoutException {
+                return f.get(timeout, unit);
+            }
+        };
     }
 }

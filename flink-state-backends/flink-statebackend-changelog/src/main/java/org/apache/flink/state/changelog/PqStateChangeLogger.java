@@ -15,33 +15,11 @@
  * limitations under the License.
  */
 
-package org.apache.flink.runtime.state.changelog;
+package org.apache.flink.state.changelog;
 
-import org.apache.flink.annotation.Internal;
-import org.apache.flink.util.Preconditions;
+import java.io.IOException;
 
-/** Change of state of a keyed operator. Used for generic incremental checkpoints. */
-@Internal
-public class StateChange {
+interface PqStateChangeLogger<T> extends StateChangeLogger<T, Void> {
 
-    private final int keyGroup;
-    private final byte[] change;
-
-    public StateChange(int keyGroup, byte[] change) {
-        this.keyGroup = keyGroup;
-        this.change = Preconditions.checkNotNull(change);
-    }
-
-    @Override
-    public String toString() {
-        return String.format("keyGroup=%d, dataSize=%d", keyGroup, change.length);
-    }
-
-    public int getKeyGroup() {
-        return keyGroup;
-    }
-
-    public byte[] getChange() {
-        return change;
-    }
+    void stateElementPolled() throws IOException;
 }

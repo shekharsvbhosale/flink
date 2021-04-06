@@ -32,6 +32,8 @@ import static org.apache.flink.util.Preconditions.checkState;
 @Internal
 public interface SequenceNumber extends Comparable<SequenceNumber> {
 
+    SequenceNumber FIRST = of(0L);
+
     SequenceNumber next();
 
     /** Generic {@link SequenceNumber}. */

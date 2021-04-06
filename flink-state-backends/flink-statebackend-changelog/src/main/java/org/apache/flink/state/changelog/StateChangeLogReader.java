@@ -15,33 +15,31 @@
  * limitations under the License.
  */
 
-package org.apache.flink.runtime.state.changelog;
+package org.apache.flink.state.changelog;
 
-import org.apache.flink.annotation.Internal;
-import org.apache.flink.util.Preconditions;
+import org.apache.flink.core.memory.DataInputView;
 
-/** Change of state of a keyed operator. Used for generic incremental checkpoints. */
-@Internal
-public class StateChange {
+interface StateChangeLogReader {
 
-    private final int keyGroup;
-    private final byte[] change;
+    void readAndApply(
+            DataInputView in, int keyGroup, ChangelogKeyedStateBackend<?, ?> backend, ClassLoader ucl)
+            throws Exception;
 
-    public StateChange(int keyGroup, byte[] change) {
-        this.keyGroup = keyGroup;
-        this.change = Preconditions.checkNotNull(change);
-    }
+    interface ChangeApplier<Key, Namespace> {
+        void setKey(Key key);
 
-    @Override
-    public String toString() {
-        return String.format("keyGroup=%d, dataSize=%d", keyGroup, change.length);
-    }
+        void setNamespace(Namespace namespace);
 
-    public int getKeyGroup() {
-        return keyGroup;
-    }
+        void applyStateClear();
 
-    public byte[] getChange() {
-        return change;
+        void applyStateUpdate(DataInputView in) throws Exception;
+
+        void applyStateAdded(DataInputView in) throws Exception;
+
+        void applyStateElementChanged(DataInputView in) throws Exception;
+
+        void applyNameSpaceMerge(DataInputView in) throws Exception;
+
+        void applyStateElementRemoved(DataInputView in) throws Exception;
     }
 }

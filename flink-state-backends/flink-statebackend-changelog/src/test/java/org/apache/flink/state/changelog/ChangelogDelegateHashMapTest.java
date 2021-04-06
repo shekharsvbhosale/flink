@@ -20,12 +20,29 @@ package org.apache.flink.state.changelog;
 
 import org.apache.flink.api.common.typeutils.TypeSerializer;
 import org.apache.flink.runtime.execution.Environment;
+import org.apache.flink.runtime.state.CheckpointStorage;
 import org.apache.flink.runtime.state.CheckpointableKeyedStateBackend;
 import org.apache.flink.runtime.state.HashMapStateBackendTest;
 import org.apache.flink.runtime.state.KeyGroupRange;
+import org.apache.flink.runtime.state.changelog.StateChangelogWriterFactory;
+import org.apache.flink.runtime.state.changelog.inmemory.InMemoryStateChangelogWriterFactory;
+import org.apache.flink.runtime.state.storage.JobManagerCheckpointStorage;
+
+import java.io.IOException;
 
 /** Tests for {@link ChangelogStateBackend} delegating {@link HashMapStateBackendTest}. */
 public class ChangelogDelegateHashMapTest extends HashMapStateBackendTest {
+
+    protected boolean snapshotUsesStreamFactory() {
+        return false;
+    }
+
+    @Override
+    protected boolean supportsMetaInfoVerification() {
+        // todo: same for Heap
+        // todo: use constructor args?
+        return false;
+    }
 
     @Override
     protected <K> CheckpointableKeyedStateBackend<K> createKeyedBackend(
@@ -36,10 +53,26 @@ public class ChangelogDelegateHashMapTest extends HashMapStateBackendTest {
             throws Exception {
 
         return ChangelogStateBackendTestUtils.createKeyedBackend(
-                new ChangelogStateBackend(getStateBackend()),
+                new ChangelogStateBackend(
+                        super.getStateBackend(), new InMemoryStateChangelogWriterFactory()),
                 keySerializer,
                 numberOfKeyGroups,
                 keyGroupRange,
                 env);
+    }
+
+    private StateChangelogWriterFactory getStateChangelogWriterFactory() throws IOException {
+        return new InMemoryStateChangelogWriterFactory();
+    }
+
+    @Override
+    protected ChangelogStateBackend getStateBackend() throws IOException {
+        return new ChangelogStateBackend(
+                super.getStateBackend(), getStateChangelogWriterFactory());
+    }
+
+    @Override
+    protected CheckpointStorage getCheckpointStorage() {
+        return new JobManagerCheckpointStorage();
     }
 }

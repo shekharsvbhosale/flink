@@ -17,17 +17,29 @@
 
 package org.apache.flink.runtime.state.changelog.inmemory;
 
+import org.apache.flink.configuration.ReadableConfig;
 import org.apache.flink.runtime.jobgraph.OperatorID;
 import org.apache.flink.runtime.state.KeyGroupRange;
 import org.apache.flink.runtime.state.changelog.StateChangelogWriterFactory;
 
+import java.io.Serializable;
+
 /** An in-memory (non-production) implementation of {@link StateChangelogWriterFactory}. */
 public class InMemoryStateChangelogWriterFactory
-        implements StateChangelogWriterFactory<InMemoryStateChangelogHandle> {
+        implements StateChangelogWriterFactory<Void, InMemoryStateChangelogHandle> , Serializable {
+    private static final long serialVersionUID = 1L;
 
     @Override
     public InMemoryStateChangelogWriter createWriter(
-            OperatorID operatorID, KeyGroupRange keyGroupRange) {
+            String operatorID, KeyGroupRange keyGroupRange) {
         return new InMemoryStateChangelogWriter();
     }
+
+    @Override
+    public Void getReaderContext() {
+        return null;
+    }
+
+    @Override
+    public void configure(ReadableConfig config) {}
 }
