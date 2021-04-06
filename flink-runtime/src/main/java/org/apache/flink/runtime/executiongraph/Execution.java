@@ -68,6 +68,8 @@ import javax.annotation.Nullable;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -86,7 +88,6 @@ import static org.apache.flink.runtime.execution.ExecutionState.CREATED;
 import static org.apache.flink.runtime.execution.ExecutionState.DEPLOYING;
 import static org.apache.flink.runtime.execution.ExecutionState.FAILED;
 import static org.apache.flink.runtime.execution.ExecutionState.FINISHED;
-import static org.apache.flink.runtime.execution.ExecutionState.RECOVERING;
 import static org.apache.flink.runtime.execution.ExecutionState.RUNNING;
 import static org.apache.flink.runtime.execution.ExecutionState.SCHEDULED;
 import static org.apache.flink.util.Preconditions.checkNotNull;
@@ -474,11 +475,11 @@ public class Execution
     private static int getPartitionMaxParallelism(
             IntermediateResultPartition partition,
             Function<ExecutionVertexID, ExecutionVertex> getVertexById) {
-        final List<ConsumerVertexGroup> consumerVertexGroups = partition.getConsumerVertexGroups();
+        final List<ConsumerVertexGroup> consumers = partition.getConsumers();
         Preconditions.checkArgument(
-                consumerVertexGroups.size() == 1,
+                consumers.size() == 1,
                 "Currently there has to be exactly one consumer in real jobs");
-        final ConsumerVertexGroup consumerVertexGroup = consumerVertexGroups.get(0);
+        final ConsumerVertexGroup consumerVertexGroup = consumers.get(0);
         return getVertexById
                 .apply(consumerVertexGroup.getFirst())
                 .getJobVertex()
@@ -623,7 +624,7 @@ public class Execution
             }
 
             // these two are the common cases where we need to send a cancel call
-            else if (current == RECOVERING || current == RUNNING || current == DEPLOYING) {
+            else if (current == RUNNING || current == DEPLOYING) {
                 // try to transition to canceling, if successful, send the cancel call
                 if (startCancelling(NUM_CANCEL_CALL_TRIES)) {
                     return;
@@ -663,7 +664,6 @@ public class Execution
     public CompletableFuture<?> suspend() {
         switch (state) {
             case RUNNING:
-            case RECOVERING:
             case DEPLOYING:
             case CREATED:
             case SCHEDULED:
@@ -696,40 +696,35 @@ public class Execution
         return releaseFuture;
     }
 
-    private void updatePartitionConsumers(final IntermediateResultPartition partition) {
+    private void updatePartitionConsumers(
+            final Collection<IntermediateResultPartition> partitions,
+            final ConsumerVertexGroup allConsumers) {
 
-        final List<ConsumerVertexGroup> consumerVertexGroups = partition.getConsumerVertexGroups();
+        List<PartitionInfo> partitionInfos = null;
 
-        if (consumerVertexGroups.size() == 0) {
-            return;
-        }
-        if (consumerVertexGroups.size() > 1) {
-            fail(
-                    new IllegalStateException(
-                            "Currently, only a single consumer group per partition is supported."));
-            return;
-        }
-
-        for (ExecutionVertexID consumerVertexId : consumerVertexGroups.get(0)) {
+        for (ExecutionVertexID consumerVertexId : allConsumers) {
             final ExecutionVertex consumerVertex =
                     vertex.getExecutionGraphAccessor().getExecutionVertexOrThrow(consumerVertexId);
             final Execution consumer = consumerVertex.getCurrentExecutionAttempt();
             final ExecutionState consumerState = consumer.getState();
 
             // ----------------------------------------------------------------
-            // Consumer is recovering or running => send update message now
+            // Consumer is running => send update message now
             // Consumer is deploying => cache the partition info which would be
             // sent after switching to running
             // ----------------------------------------------------------------
-            if (consumerState == DEPLOYING
-                    || consumerState == RUNNING
-                    || consumerState == RECOVERING) {
-                final PartitionInfo partitionInfo = createPartitionInfo(partition);
+            if (consumerState == DEPLOYING || consumerState == RUNNING) {
+                if (partitionInfos == null) {
+                    partitionInfos =
+                            partitions.stream()
+                                    .map(Execution::createPartitionInfo)
+                                    .collect(Collectors.toList());
+                }
 
                 if (consumerState == DEPLOYING) {
-                    consumerVertex.cachePartitionInfo(partitionInfo);
+                    consumerVertex.cachePartitionInfo(partitionInfos);
                 } else {
-                    consumer.sendUpdatePartitionInfoRpcCall(Collections.singleton(partitionInfo));
+                    consumer.sendUpdatePartitionInfoRpcCall(partitionInfos);
                 }
             }
         }
@@ -856,7 +851,7 @@ public class Execution
             OperatorID operatorId, SerializedValue<OperatorEvent> event) {
         final LogicalSlot slot = assignedResource;
 
-        if (slot != null && (getState() == RUNNING || getState() == RECOVERING)) {
+        if (slot != null && getState() == RUNNING) {
             final TaskExecutorOperatorEventGateway eventGateway = slot.getTaskManagerGateway();
             return eventGateway.sendOperatorEventToTask(getAttemptId(), operatorId, event);
         } else {
@@ -907,7 +902,7 @@ public class Execution
         while (true) {
             ExecutionState current = this.state;
 
-            if (current == RECOVERING || current == RUNNING || current == DEPLOYING) {
+            if (current == RUNNING || current == DEPLOYING) {
 
                 if (transitionState(current, FINISHED)) {
                     try {
@@ -947,13 +942,24 @@ public class Execution
             return;
         }
 
+        final Map<ConsumerVertexGroup, Set<IntermediateResultPartition>> partitionConsumers =
+                new HashMap<>();
+
         for (IntermediateResultPartition finishedPartition : newlyFinishedResults) {
             final IntermediateResultPartition[] allPartitionsOfNewlyFinishedResults =
                     finishedPartition.getIntermediateResult().getPartitions();
 
             for (IntermediateResultPartition partition : allPartitionsOfNewlyFinishedResults) {
-                updatePartitionConsumers(partition);
+                for (ConsumerVertexGroup consumerVertexGroup : partition.getConsumers()) {
+                    partitionConsumers
+                            .computeIfAbsent(consumerVertexGroup, group -> new HashSet<>())
+                            .add(partition);
+                }
             }
+        }
+        for (Map.Entry<ConsumerVertexGroup, Set<IntermediateResultPartition>> entry :
+                partitionConsumers.entrySet()) {
+            updatePartitionConsumers(entry.getValue(), entry.getKey());
         }
     }
 
@@ -997,10 +1003,7 @@ public class Execution
 
             if (current == CANCELED) {
                 return;
-            } else if (current == CANCELING
-                    || current == RUNNING
-                    || current == RECOVERING
-                    || current == DEPLOYING) {
+            } else if (current == CANCELING || current == RUNNING || current == DEPLOYING) {
 
                 updateAccumulatorsAndMetrics(userAccumulators, metrics);
 
@@ -1032,8 +1035,8 @@ public class Execution
         handlePartitionCleanup(releasePartitions, releasePartitions);
     }
 
-    void cachePartitionInfo(PartitionInfo partitionInfo) {
-        partitionInfos.add(partitionInfo);
+    void cachePartitionInfo(Collection<PartitionInfo> partitionInfos) {
+        this.partitionInfos.addAll(partitionInfos);
     }
 
     private void sendPartitionInfos() {
@@ -1136,10 +1139,7 @@ public class Execution
 
         handlePartitionCleanup(releasePartitions, releasePartitions);
 
-        if (cancelTask
-                && (stateBeforeFailed == RUNNING
-                        || stateBeforeFailed == RECOVERING
-                        || stateBeforeFailed == DEPLOYING)) {
+        if (cancelTask && (stateBeforeFailed == RUNNING || stateBeforeFailed == DEPLOYING)) {
             if (LOG.isDebugEnabled()) {
                 LOG.debug("Sending out cancel request, to remove task execution from TaskManager.");
             }
@@ -1158,22 +1158,10 @@ public class Execution
         }
     }
 
-    boolean switchToRecovering() {
-        if (switchTo(DEPLOYING, RECOVERING)) {
-            sendPartitionInfos();
-            return true;
-        }
-
-        return false;
-    }
-
     boolean switchToRunning() {
-        return switchTo(RECOVERING, RUNNING);
-    }
 
-    private boolean switchTo(ExecutionState from, ExecutionState to) {
-
-        if (transitionState(from, to)) {
+        if (transitionState(DEPLOYING, RUNNING)) {
+            sendPartitionInfos();
             return true;
         } else {
             // something happened while the call was in progress.
