@@ -65,6 +65,7 @@ import org.apache.flink.streaming.api.operators.YieldingOperatorFactory;
 import org.apache.flink.streaming.api.transformations.ShuffleMode;
 import org.apache.flink.streaming.runtime.partitioner.CustomPartitionerWrapper;
 import org.apache.flink.streaming.runtime.partitioner.ForwardPartitioner;
+import org.apache.flink.streaming.runtime.partitioner.RescalePartitioner;
 import org.apache.flink.streaming.runtime.partitioner.StreamPartitioner;
 import org.apache.flink.streaming.runtime.tasks.StreamIterationHead;
 import org.apache.flink.streaming.runtime.tasks.StreamIterationTail;
@@ -722,7 +723,6 @@ public class StreamingJobGraphGenerator {
         config.setStateBackend(streamGraph.getStateBackend());
         config.setCheckpointStorage(streamGraph.getCheckpointStorage());
         config.setSavepointDir(streamGraph.getSavepointDirectory());
-        config.setCheckpointStorage(streamGraph.getCheckpointStorage());
         config.setGraphContainingLoops(streamGraph.isIterative());
         config.setTimerServiceProvider(streamGraph.getTimerServiceProvider());
         config.setCheckpointingEnabled(checkpointCfg.isCheckpointingEnabled());
@@ -798,7 +798,7 @@ public class StreamingJobGraphGenerator {
         checkAndResetBufferTimeout(resultPartitionType, edge);
 
         JobEdge jobEdge;
-        if (partitioner.isPointwise()) {
+        if (isPointwisePartitioner(partitioner)) {
             jobEdge =
                     downStreamVertex.connectNewDataSetAsInput(
                             headVertex, DistributionPattern.POINTWISE, resultPartitionType);
@@ -837,6 +837,11 @@ public class StreamingJobGraphGenerator {
         }
     }
 
+    private static boolean isPointwisePartitioner(StreamPartitioner<?> partitioner) {
+        return partitioner instanceof ForwardPartitioner
+                || partitioner instanceof RescalePartitioner;
+    }
+
     private ResultPartitionType determineResultPartitionType(StreamPartitioner<?> partitioner) {
         switch (streamGraph.getGlobalDataExchangeMode()) {
             case ALL_EDGES_BLOCKING:
@@ -848,7 +853,7 @@ public class StreamingJobGraphGenerator {
                     return ResultPartitionType.BLOCKING;
                 }
             case POINTWISE_EDGES_PIPELINED:
-                if (partitioner.isPointwise()) {
+                if (isPointwisePartitioner(partitioner)) {
                     return ResultPartitionType.PIPELINED_BOUNDED;
                 } else {
                     return ResultPartitionType.BLOCKING;
