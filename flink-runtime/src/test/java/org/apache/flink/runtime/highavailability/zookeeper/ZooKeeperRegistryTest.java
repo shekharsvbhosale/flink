@@ -27,6 +27,9 @@ import org.apache.flink.runtime.highavailability.HighAvailabilityServices;
 import org.apache.flink.runtime.highavailability.RunningJobsRegistry;
 import org.apache.flink.runtime.highavailability.RunningJobsRegistry.JobSchedulingStatus;
 import org.apache.flink.runtime.util.ZooKeeperUtils;
+
+import org.apache.flink.shaded.curator4.org.apache.curator.framework.CuratorFramework;
+
 import org.apache.flink.util.TestLogger;
 
 import org.apache.curator.test.TestingServer;
@@ -62,9 +65,11 @@ public class ZooKeeperRegistryTest extends TestLogger {
                 HighAvailabilityOptions.HA_ZOOKEEPER_QUORUM, testingServer.getConnectString());
         configuration.setString(HighAvailabilityOptions.HA_MODE, "zookeeper");
 
+        final CuratorFramework zkClient = ZooKeeperUtils.startCuratorFramework(configuration);
+
         final HighAvailabilityServices zkHaService =
                 new ZooKeeperHaServices(
-                        ZooKeeperUtils.startCuratorFramework(configuration),
+                        zkClient,
                         Executors.directExecutor(),
                         configuration,
                         new VoidBlobStore());
@@ -75,14 +80,20 @@ public class ZooKeeperRegistryTest extends TestLogger {
             JobID jobID = JobID.generate();
             assertEquals(JobSchedulingStatus.PENDING, zkRegistry.getJobSchedulingStatus(jobID));
 
+            // set when znode does not exist for job
             zkRegistry.setJobRunning(jobID);
             assertEquals(JobSchedulingStatus.RUNNING, zkRegistry.getJobSchedulingStatus(jobID));
 
+            // set when znode does exist for job
             zkRegistry.setJobFinished(jobID);
             assertEquals(JobSchedulingStatus.DONE, zkRegistry.getJobSchedulingStatus(jobID));
 
             zkRegistry.clearJob(jobID);
             assertEquals(JobSchedulingStatus.PENDING, zkRegistry.getJobSchedulingStatus(jobID));
+
+            // clear when znode does not exist for job
+            zkRegistry.clearJob(jobID);
+            zkClient.delete().forPath(jobID.toString());
         } finally {
             zkHaService.close();
         }
