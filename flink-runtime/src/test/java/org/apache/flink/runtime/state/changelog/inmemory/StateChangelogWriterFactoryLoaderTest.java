@@ -44,7 +44,7 @@ public class StateChangelogWriterFactoryLoaderTest {
     @Test
     @SuppressWarnings("rawtypes")
     public void testLoadPluginImplementation() {
-        StateChangelogWriterFactory<?> impl = new InMemoryStateChangelogWriterFactory();
+        StateChangelogWriterFactory<?, ?> impl = new InMemoryStateChangelogWriterFactory();
         PluginManager pluginManager = getPluginManager(singletonList(impl).iterator());
         Iterator<StateChangelogWriterFactory> loaded =
                 new StateChangelogWriterFactoryLoader(pluginManager).load();
@@ -52,7 +52,7 @@ public class StateChangelogWriterFactoryLoaderTest {
     }
 
     private PluginManager getPluginManager(
-            Iterator<? extends StateChangelogWriterFactory<?>> iterator) {
+            Iterator<? extends StateChangelogWriterFactory<?, ?>> iterator) {
         return new PluginManager() {
 
             @Override

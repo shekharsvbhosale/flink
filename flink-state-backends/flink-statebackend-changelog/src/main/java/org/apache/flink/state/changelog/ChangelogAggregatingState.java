@@ -20,7 +20,10 @@ package org.apache.flink.state.changelog;
 
 import org.apache.flink.api.common.state.AggregatingState;
 import org.apache.flink.api.common.state.State;
+import org.apache.flink.runtime.state.RegisteredKeyValueStateBackendMetaInfo;
 import org.apache.flink.runtime.state.changelog.StateChange;
+import org.apache.flink.runtime.state.changelog.StateChangelogWriter;
+import org.apache.flink.runtime.state.heap.InternalKeyContext;
 import org.apache.flink.runtime.state.internal.InternalAggregatingState;
 import org.apache.flink.runtime.state.internal.InternalKvState;
 
@@ -40,12 +43,15 @@ class ChangelogAggregatingState<K, N, IN, ACC, OUT>
         extends AbstractChangelogState<K, N, ACC, InternalAggregatingState<K, N, IN, ACC, OUT>>
         implements InternalAggregatingState<K, N, IN, ACC, OUT> {
 
-    ChangelogAggregatingState(InternalAggregatingState<K, N, IN, ACC, OUT> delegatedState) {
-        super(delegatedState);
+    ChangelogAggregatingState(
+            InternalAggregatingState<K, N, IN, ACC, OUT> delegatedState,
+            KvStateChangeLogger<ACC, N> changeLogger) {
+        super(delegatedState, changeLogger);
     }
 
     @Override
     public void mergeNamespaces(N target, Collection<N> sources) throws Exception {
+        changeLogger.stateMerged(target, sources);
         delegatedState.mergeNamespaces(target, sources);
     }
 
@@ -56,6 +62,7 @@ class ChangelogAggregatingState<K, N, IN, ACC, OUT>
 
     @Override
     public void updateInternal(ACC valueToStore) throws Exception {
+        changeLogger.stateUpdated(valueToStore, getCurrentNamespace());
         delegatedState.updateInternal(valueToStore);
     }
 
@@ -67,18 +74,26 @@ class ChangelogAggregatingState<K, N, IN, ACC, OUT>
     @Override
     public void add(IN value) throws Exception {
         delegatedState.add(value);
+        changeLogger.stateUpdated(delegatedState.getInternal(), getCurrentNamespace());
     }
 
     @Override
     public void clear() {
+        changeLogger.stateCleared(getCurrentNamespace());
         delegatedState.clear();
     }
 
     @SuppressWarnings("unchecked")
     static <T, K, N, SV, S extends State, IS extends S> IS create(
-            InternalKvState<K, N, SV> aggregatingState) {
+            InternalKvState<K, N, SV> aggregatingState, KvStateChangeLogger<SV, N> changeLogger) {
         return (IS)
                 new ChangelogAggregatingState<>(
-                        (InternalAggregatingState<K, N, T, SV, ?>) aggregatingState);
+                        (InternalAggregatingState<K, N, T, SV, ?>) aggregatingState, changeLogger);
+    }
+
+    @Override
+    public StateChangeLogReader.ChangeApplier<K, N> getChangeApplier(
+            ChangelogApplierFactory factory) {
+        return factory.forAggregating(this.delegatedState, ctx);
     }
 }

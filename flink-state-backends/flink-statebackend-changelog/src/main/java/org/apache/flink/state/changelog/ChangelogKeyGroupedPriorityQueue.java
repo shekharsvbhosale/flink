@@ -18,13 +18,19 @@
 
 package org.apache.flink.state.changelog;
 
+import org.apache.flink.api.common.typeutils.TypeSerializer;
 import org.apache.flink.runtime.state.KeyGroupedInternalPriorityQueue;
 import org.apache.flink.util.CloseableIterator;
+import org.apache.flink.util.ExceptionUtils;
 
 import javax.annotation.Nullable;
 
+import java.io.IOException;
 import java.util.Collection;
 import java.util.Set;
+
+import static org.apache.flink.state.changelog.StateChangeLogger.loggingIterator;
+import static org.apache.flink.util.Preconditions.checkNotNull;
 
 /**
  * A {@link KeyGroupedInternalPriorityQueue} that keeps state on the underlying delegated {@link
@@ -32,10 +38,16 @@ import java.util.Set;
  */
 public class ChangelogKeyGroupedPriorityQueue<T> implements KeyGroupedInternalPriorityQueue<T> {
     private final KeyGroupedInternalPriorityQueue<T> delegatedPriorityQueue;
+    private final PqStateChangeLogger<T> logger;
+    private final TypeSerializer<T> serializer;
 
     public ChangelogKeyGroupedPriorityQueue(
-            KeyGroupedInternalPriorityQueue<T> delegatedPriorityQueue) {
-        this.delegatedPriorityQueue = delegatedPriorityQueue;
+            KeyGroupedInternalPriorityQueue<T> delegatedPriorityQueue,
+            PqStateChangeLogger<T> logger,
+            TypeSerializer<T> serializer) {
+        this.delegatedPriorityQueue = checkNotNull(delegatedPriorityQueue);
+        this.logger = checkNotNull(logger);
+        this.serializer = serializer;
     }
 
     @Override
@@ -46,6 +58,11 @@ public class ChangelogKeyGroupedPriorityQueue<T> implements KeyGroupedInternalPr
     @Nullable
     @Override
     public T poll() {
+        try {
+            logger.stateElementPolled();
+        } catch (IOException e) {
+            ExceptionUtils.rethrow(e);
+        }
         return delegatedPriorityQueue.poll();
     }
 
@@ -57,11 +74,21 @@ public class ChangelogKeyGroupedPriorityQueue<T> implements KeyGroupedInternalPr
 
     @Override
     public boolean add(T toAdd) {
+        try {
+            logger.stateElementChanged(out -> serializer.serialize(toAdd, out), null);
+        } catch (IOException e) {
+            ExceptionUtils.rethrow(e);
+        }
         return delegatedPriorityQueue.add(toAdd);
     }
 
     @Override
     public boolean remove(T toRemove) {
+        try {
+            logger.stateElementRemoved(out -> serializer.serialize(toRemove, out), null);
+        } catch (IOException e) {
+            ExceptionUtils.rethrow(e);
+        }
         return delegatedPriorityQueue.remove(toRemove);
     }
 
@@ -77,12 +104,27 @@ public class ChangelogKeyGroupedPriorityQueue<T> implements KeyGroupedInternalPr
 
     @Override
     public void addAll(@Nullable Collection<? extends T> toAdd) {
+        if (toAdd == null) {
+            return;
+        }
+        try {
+            logger.stateElementChanged(
+                    out -> {
+                        for (T x : toAdd) {
+                            serializer.serialize(x, out);
+                        }
+                    },
+                    null);
+        } catch (IOException e) {
+            ExceptionUtils.rethrow(e);
+        }
         delegatedPriorityQueue.addAll(toAdd);
     }
 
     @Override
     public CloseableIterator<T> iterator() {
-        // TODO: Wrap with loggingIterator implemented in FLINK-21355
-        return delegatedPriorityQueue.iterator();
+        return CloseableIterator.adapterForIterator(
+                loggingIterator(
+                        delegatedPriorityQueue.iterator(), logger, serializer::serialize, null));
     }
 }
