@@ -135,6 +135,22 @@ public class DispatcherResourceManagerComponent implements AutoCloseableAsync {
         }
     }
 
+    /**
+     * Close the web monitor and cluster components. This method will not deregister the Flink
+     * application from the resource management.
+     *
+     * @return Future which is completed once the shut down
+     */
+    public CompletableFuture<Void> closeAsyncWithoutDeregisteringApplication() {
+
+        if (isRunning.compareAndSet(true, false)) {
+            return FutureUtils.composeAfterwards(
+                    webMonitorEndpoint.closeAsync(), this::closeAsyncInternal);
+        } else {
+            return terminationFuture;
+        }
+    }
+
     private CompletableFuture<Void> deregisterApplication(
             final ApplicationStatus applicationStatus, final @Nullable String diagnostics) {
 
